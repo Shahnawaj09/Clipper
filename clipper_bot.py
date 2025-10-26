@@ -613,12 +613,12 @@ def build_app():
     app.add_handler(CommandHandler("feedback", feedback))
     app.add_handler(CommandHandler("donate", donate))
     app.add_handler(CallbackQueryHandler(callback_handler))
+
     # only_text_allowed will handle plain texts and drop non-text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_range_text))
     app.add_handler(MessageHandler(filters.ALL, only_text_allowed))
-    # Option B — after build:
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.post_init.append(bot_startup)
+
+    app.post_init.append(bot_startup)
     return app
 
 # ---- run ----
