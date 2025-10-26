@@ -616,7 +616,9 @@ def build_app():
     # only_text_allowed will handle plain texts and drop non-text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_range_text))
     app.add_handler(MessageHandler(filters.ALL, only_text_allowed))
-    app.on_startup.append(bot_startup)
+    # Option B — after build:
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+app.post_init.append(bot_startup)
     return app
 
 # ---- run ----
