@@ -42,4 +42,4 @@ RUN mkdir -p /app/tmp_clips && chmod -R 777 /app/tmp_clips
 ENV TMP_DIR=/app/tmp_clips
 
 # default command — run the bot
-CMD ["python", "Clipper_bot_py"]
+CMD ["python", "clipper_bot.py"]
