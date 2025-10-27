@@ -37,8 +37,7 @@ async def start_health_server():
     await site.start()
     # don't block: leave site running in background
 
-# start server task so Render sees an open port
-asyncio.create_task(start_health_server())
+                                               
 
 load_dotenv()
 
@@ -658,6 +657,11 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     logger.info("🚀 Clipper Bot started!")
+    # --- fix: start Render health server safely inside the event loop ---
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_health_server())
+    # -------------------------------------------------------------------
+    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
