@@ -21,6 +21,24 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 import yt_dlp
 from moviepy.editor import VideoFileClip
+from aiohttp import web  # add this line
+
+# --- Health server for Render ---
+async def health(request):
+    return web.Response(text="ok")
+
+async def start_health_server():
+    port = int(os.environ.get("PORT", os.environ.get("HTTP_PORT", 8080)))
+    app = web.Application()
+    app.router.add_get("/healthz", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    # don't block: leave site running in background
+
+# start server task so Render sees an open port
+asyncio.create_task(start_health_server())
 
 load_dotenv()
 
