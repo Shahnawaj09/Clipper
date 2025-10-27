@@ -20,7 +20,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 import yt_dlp
-from moviepy import VideoFileClip
+from moviepy.editor import VideoFileClip
 
 load_dotenv()
 
