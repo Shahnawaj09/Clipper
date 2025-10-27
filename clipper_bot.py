@@ -1,1149 +1,647 @@
-#!/usr/bin/env python3
-"""
-Clipper bot: (Refactored & UI Enhanced)
-- Accepts text messages (YouTube links). Blocks files/photos.
-- /help, /feedback, /donate commands.
-- Features a single, self-updating inline menu for:
-  - Clip length (5,10,20,30,Custom up to MAX_CLIP_SECONDS)
-  - Number of clips (up to MAX_CLIPS)
-  - Format/quality from available source formats.
-- Supports custom range like "00H08M10S:00H09M20S" or "2:32-3:23" or "152-203".
-- Shows a ⚡ spinner + percentage while working, deletes spinner when done.
-- For files > 50MB uploads to GoFile and returns link (Telegram's limit is 50MB).
-- Auto-deletes user messages and commands to keep chat clean.
-"""
 import os
 import re
-import shlex
-import json
-import time
-import random
-import shutil
 import asyncio
 import logging
-import subprocess
-from typing import Optional, Tuple, List, Dict, Any
-
-import requests
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict, List
 from dotenv import load_dotenv
-from yt_dlp import YoutubeDL
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    MessageEntity,
-)
-from telegram.constants import ParseMode
-from telegram.error import BadRequest
+
+import aiohttp
+import aiofiles
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
-
-# ---- 1. Config / Env ----
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID")) if os.getenv("ADMIN_ID") else None
-TMP_DIR = os.getenv("TMP_DIR", "tmp_clips")
-GOFILE_API_KEY = os.getenv("GOFILE_API_KEY", "") or None
-MAX_CLIP_SECONDS = int(os.getenv("MAX_CLIP_SECONDS", "180"))
-MAX_CLIPS = int(os.getenv("MAX_CLIPS", "5"))
-# Telegram's file limit is 50MB, not 20MB.
-TELEGRAM_FILE_LIMIT_MB = 49
-
-# Safety
-if MAX_CLIP_SECONDS > 10 * 60:  # Increase safety limit slightly
-    MAX_CLIP_SECONDS = min(MAX_CLIP_SECONDS, 10 * 60)
-
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("clipper")
-
-# Spinner
-SPINNER_FRAMES = ["⚡", "⚡️", "⚡⚡", "⚡️⚡️"]
-
-# Make tmp dir
-os.makedirs(TMP_DIR, exist_ok=True)
-
-
-# ---- 2. Time & String Helpers ----
-
-def clean_tmp():
-    """Best-effort cleanup of TMP_DIR"""
-    for f in os.listdir(TMP_DIR):
-        try:
-            path = os.path.join(TMP_DIR, f)
-            if os.path.isfile(path) or os.path.islink(path):
-                os.unlink(path)
-            elif os.path.isdir(path):
-                shutil.rmtree(path)
-        except Exception as e:
-            logger.warning(f"Failed to clean tmp file {f}: {e}")
-
-def safe_filename(name: str):
-    return re.sub(r"[^\w\-.]", "_", name)[:180]
-
-def parse_time_to_seconds(t: str) -> Optional[int]:
-    """
-    Accepts many formats:
-      - "00H08M10S"
-      - "2:32" => 152
-      - "2:32:10"
-      - "152" => 152
-    Returns seconds or None
-    """
-    t = t.strip().upper()
-    # H M S pattern
-    m = re.match(r'(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$', t)
-    if m and (m.group(1) or m.group(2) or m.group(3)):
-        h = int(m.group(1) or 0)
-        mm = int(m.group(2) or 0)
-        s = int(m.group(3) or 0)
-        return h * 3600 + mm * 60 + s
-    # colon format
-    if ":" in t:
-        parts = [int(p) for p in t.split(":") if p.strip().isdigit()]
-        if len(parts) == 2:  # mm:ss
-            return parts[0] * 60 + parts[1]
-        if len(parts) == 3:  # hh:mm:ss
-            return parts[0] * 3600 + parts[1] * 60 + parts[2]
-    # pure digits
-    if re.fullmatch(r"\d+", t):
-        return int(t)
-    return None
-
-def parse_range(s: str) -> Optional[Tuple[int, int]]:
-    """
-    Accepts:
-     - '00H08M10S:00H09M20S'
-     - '2:32-3:23'
-     - '152-203'
-     - '2:32 - 3:23' etc
-    Returns (start_sec, end_sec) or None
-    """
-    s = s.strip()
-    parts = re.split(r'\s*[-–to:aws]+\s*', s, flags=re.I)
-    
-    if len(parts) == 2: # 'start-end' or 'start:end'
-        a = parse_time_to_seconds(parts[0])
-        b = parse_time_to_seconds(parts[1])
-        if a is not None and b is not None and b > a:
-            return a, b
-            
-    # Try to find two time-like strings
-    tokens = re.findall(r'[\dHMS:]+', s, flags=re.I)
-    if len(tokens) >= 2:
-        a = parse_time_to_seconds(tokens[0])
-        b = parse_time_to_seconds(tokens[-1]) # Use first and last
-        if a is not None and b is not None and b > a:
-            return a, b
-            
-    return None
-
-def sec_to_hms(s: int) -> str:
-    h = s // 3600
-    m = (s % 3600) // 60
-    ss = s % 60
-    return f"{h:02d}:{m:02d}:{ss:02d}"
-
-def sec_to_human(s: int) -> str:
-    if s < 60:
-        return f"{s}s"
-    m, s = divmod(s, 60)
-    if m < 60:
-        return f"{m}m {s}s"
-    h, m = divmod(m, 60)
-    return f"{h}h {m}m {s}s"
-
-
-# ---- 3. Blocking I/O Helpers (to be run in executor) ----
-
-def run_subprocess_sync(cmd: List[str], timeout: int = 600):
-    """Run subprocess and return stdout. Raise on error."""
-    logger.info("Running cmd: %s", " ".join(shlex.quote(p) for p in cmd))
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, encoding='utf-8'
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr or proc.stdout or "process failed")
-        return proc.stdout
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"Process timed out after {timeout}s")
-    except Exception as e:
-        logger.error(f"Subprocess failed: {e}")
-        raise
-
-def gofile_upload_sync(filepath: str, timeout=120) -> Optional[str]:
-    """Uploads a file to GoFile. Blocking."""
-    if not GOFILE_API_KEY:
-        logger.warning("GOFILE_API_KEY not set. Cannot upload.")
-        return None
-    try:
-        r_server = requests.get("https://api.gofile.io/getServer", timeout=10)
-        r_server.raise_for_status()
-        server = r_server.json().get("data", {}).get("server")
-        if not server:
-            logger.error("GoFile: Could not get server.")
-            return None
-        
-        upload_url = f"https://{server}.gofile.io/uploadFile"
-        headers = {"Authorization": f"Bearer {GOFILE_API_KEY}"}
-        
-        with open(filepath, "rb") as fh:
-            files = {"file": (os.path.basename(filepath), fh)}
-            resp = requests.post(upload_url, files=files, headers=headers, timeout=timeout)
-        
-        resp.raise_for_status()
-        j = resp.json()
-        
-        if j.get("status") == "ok":
-            return j["data"]["downloadPage"]
-        else:
-            logger.warning("GoFile upload failed: %s", j)
-            return None
-    except Exception as e:
-        logger.exception("GoFile upload error: %s", e)
-    return None
-
-def get_video_info_sync(url: str, timeout=30) -> dict:
-    """Gets video info using yt-dlp. Blocking."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": "best",
-        "socket_timeout": timeout,
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-def list_qualities_sync(info: dict) -> List[Tuple[str, str, int]]:
-    """
-    Returns list of tuples (format_code, label, height) sorted by height desc.
-    label example: "1080p (webm)"
-    """
-    fmts = info.get("formats", [])
-    candidates = []
-    seen = set()
-    for f in fmts:
-        # We need formats that have both video and audio, or are video-only
-        # (yt-dlp will merge with best audio).
-        if f.get("vcodec") == "none":
-            continue
-            
-        fmt_id = f.get("format_id")
-        height = f.get("height") or 0
-        ext = f.get("ext") or "unknown"
-        vcodec = f.get("vcodec", "unknown")
-        
-        # Create a more descriptive label
-        label = f"{height}p" if height else f.get("format_note", "video")
-        if "avc" in vcodec:
-            label += " (mp4)"
-        elif "vp9" in vcodec:
-            label += " (webm)"
-        else:
-            label += f" ({ext})"
-            
-        key = (height, ext) # De-duplicate based on height and extension
-        if key not in seen and fmt_id:
-            candidates.append((fmt_id, label, height))
-            seen.add(key)
-            
-    # Sort by height descending
-    candidates.sort(key=lambda x: x[2], reverse=True)
-    
-    if not candidates:
-        return [("best", "best", 0)]
-        
-    return [(c[0], c[1], c[2]) for c in candidates]
-
-
-# ---- 4. Telegram UI Generation ----
-
-async def generate_menu_message(context: ContextTypes.DEFAULT_TYPE) -> Tuple[str, InlineKeyboardMarkup]:
-    """Generates the text and keyboard for the main UI menu."""
-    data = context.user_data
-    state = data.get("state", {})
-    
-    # Get selections
-    sel_dur_val = state.get("duration")
-    sel_dur_range = state.get("custom_range")
-    sel_count = state.get("count")
-    sel_fmt = state.get("format")
-    sel_fmt_label = state.get("format_label", sel_fmt)
-
-    # --- Build Text ---
-    text = f"*Video:* `{data.get('title', '...')}`\n"
-    text += f"*Duration:* `{sec_to_human(data.get('duration', 0))}`\n\n"
-    text += "*Your Selections:*\n"
-    
-    # Duration text
-    if sel_dur_range:
-        start, end = sel_dur_range
-        text += f" • *Range:* `{sec_to_hms(start)} - {sec_to_hms(end)}` ({end-start}s)\n"
-    elif sel_dur_val:
-        text += f" • *Clip Length:* `{sel_dur_val}s`\n"
-    else:
-        text += f" • *Clip Length:* `(Not set)`\n"
-
-    # Count text
-    if sel_dur_range:
-        text += f" • *Num Clips:* `1 (Custom Range)`\n"
-        sel_count = 1 # Force count to 1 for custom range
-        state["count"] = 1
-    else:
-        text += f" • *Num Clips:* `{sel_count or '(Not set)'}`\n"
-
-    # Format text
-    text += f" • *Quality:* `{sel_fmt_label or '(Not set)'}`\n"
-
-    # --- Build Keyboard ---
-    keyboard = []
-    
-    # Row 1: Duration
-    dur_buttons = [
-        InlineKeyboardButton(f"{'✅ ' if sel_dur_val == 5 else ''}5s", callback_data="set:dur:5"),
-        InlineKeyboardButton(f"{'✅ ' if sel_dur_val == 10 else ''}10s", callback_data="set:dur:10"),
-        InlineKeyboardButton(f"{'✅ ' if sel_dur_val == 20 else ''}20s", callback_data="set:dur:20"),
-        InlineKeyboardButton(f"{'✅ ' if sel_dur_val == 30 else ''}30s", callback_data="set:dur:30"),
-    ]
-    keyboard.append(dur_buttons)
-    
-    # Row 2: Custom Range
-    custom_label = f"✅ Custom Range" if sel_dur_range else "Custom Range"
-    keyboard.append([InlineKeyboardButton(custom_label, callback_data="set:dur:custom")])
-    
-    # Row 3: Clip Count (disabled if custom range is set)
-    if not sel_dur_range:
-        max_clips_allowed = min(MAX_CLIPS, max(1, data.get('duration', 0) // 5))
-        count_buttons = []
-        for i in range(1, max_clips_allowed + 1):
-            count_buttons.append(
-                InlineKeyboardButton(f"{'✅ ' if sel_count == i else ''}{i}", callback_data=f"set:count:{i}")
-            )
-        keyboard.append(count_buttons)
-
-    # Row 4+: Quality
-    qualities = data.get("qualities", [])
-    # Group qualities into rows of 2
-    for i in range(0, len(qualities[:6]), 2):
-        q_row = []
-        for fmt_id, label, height in qualities[i:i+2]:
-            q_row.append(
-                InlineKeyboardButton(f"{'✅ ' if sel_fmt == fmt_id else ''}{label}", callback_data=f"set:fmt:{fmt_id}:{label}")
-            )
-        keyboard.append(q_row)
-
-    # Final Row: Start / Download / Cancel
-    final_row = [InlineKeyboardButton("❌ Cancel", callback_data="action:cancel")]
-    
-    # Check if ready to start
-    if (sel_dur_val or sel_dur_range) and sel_count and sel_fmt:
-        final_row.insert(0, InlineKeyboardButton("✨ START CLIPPING ✨", callback_data="action:start"))
-    
-    final_row.append(InlineKeyboardButton("💾 Full Video", callback_data="action:full"))
-    keyboard.append(final_row)
-    
-    return text, InlineKeyboardMarkup(keyboard)
-
-async def clear_menu(context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Deletes the main menu and clears user_data state."""
-    menu_msg_id = context.user_data.get("menu_msg_id")
-    if menu_msg_id:
-        try:
-            await context.bot.edit_message_text(
-                text=text,
-                chat_id=context._chat_id,
-                message_id=menu_msg_id,
-                reply_markup=None
-            )
-        except BadRequest:
-            pass # Message might be deleted already
-    context.user_data.clear()
-
-
-# ---- 5. Telegram Handlers ----
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.delete()
-    await update.effective_user.send_message(
-        "Send me a YouTube link (just paste) and I'll help you cut clips.\n"
-        "Use /help for full instructions."
-    )
-    context.user_data.clear()
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.delete()
-    txt = (
-        "*Clipper Bot Guide:*\n\n"
-        "1. Paste a YouTube link.\n"
-        "2. A menu will appear. Select your desired *clip length*, *number of clips*, and *quality*.\n"
-        "3. Once all three are set, a `✨ START CLIPPING ✨` button will appear.\n\n"
-        "*Custom Range:*\n"
-        " • Select `Custom Range`.\n"
-        " • The bot will ask you to send a range.\n"
-        " • Reply with a range like `2:32-3:23`, `152-203`, or `00H08M10S-00H09M20S`.\n"
-        " • This will automatically set *Num Clips* to 1.\n\n"
-        "*Other Buttons:*\n"
-        " • `💾 Full Video`: Downloads the entire video.\n"
-        " • `❌ Cancel`: Cancels the current operation.\n\n"
-        "*Commands:*\n"
-        " /feedback <your message> - Send a message to the admin.\n"
-        " /donate - Get donation info."
-    )
-    await update.effective_user.send_message(txt, parse_mode=ParseMode.MARKDOWN)
-
-async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.delete()
-    upi = "upi://pay?pn=MD%20SHAHNAWAJ&am=&mode=01&pa=md.3282-40@waaxis"
-    await context.bot.send_message(
-        chat_id=update.effective_user.id,
-        text=f"Thank you for considering a donation!\n\nUse this link:\n`{upi}`",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    user = update.effective_user
-    feedback_text = msg.text.partition(' ')[2] # Get text after /feedback
-
-    if not feedback_text:
-        await msg.delete()
-        await msg.reply_text("Please write your feedback after the command, e.g., `/feedback This bot is great!`")
-        return
-
-    body = f"Feedback from {user.id} (@{user.username or 'N/A'}):\n\n{feedback_text}"
-    
-    try:
-        if ADMIN_ID:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=body)
-        await msg.reply_text("Thanks, your feedback has been sent to the admin.")
-    except Exception as e:
-        logger.exception("Failed to forward feedback")
-        await msg.reply_text("Sorry, failed to send feedback. Please try again later.")
-    
-    await asyncio.sleep(2)
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main handler for all non-command text."""
-    msg = update.message
-    chat_id = msg.chat_id
-    text = (msg.text or "").strip()
-    
-    # --- 1. Check if we are awaiting a custom range ---
-    if context.user_data.get("await_custom_range"):
-        await msg.delete() # Delete user's range message
-        rng = parse_range(text)
-        if not rng:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Couldn't parse range. Try `2:32-3:23` or `152-203`.",
-                reply_to_message_id=context.user_data.get("menu_msg_id")
-            )
-            return # Keep awaiting
-
-        start, end = rng
-        length = end - start
-        if length <= 0 or length > MAX_CLIP_SECONDS:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"Invalid range. Max clip length is {MAX_CLIP_SECONDS}s.",
-                reply_to_message_id=context.user_data.get("menu_msg_id")
-            )
-            return
-
-        # Success! Save state and update menu
-        context.user_data["await_custom_range"] = False
-        state = context.user_data.setdefault("state", {})
-        state["custom_range"] = (start, end)
-        state["duration"] = None # Clear fixed duration
-        state["count"] = 1 # Custom range is always 1 clip
-        
-        # Update the menu
-        menu_text, keyboard = await generate_menu_message(context)
-        await context.bot.edit_message_text(
-            text=menu_text,
-            chat_id=chat_id,
-            message_id=context.user_data.get("menu_msg_id"),
-            reply_markup=keyboard,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    # --- 2. Check if it's a YouTube link ---
-    is_youtube = "youtube.com" in text or "youtu.be" in text
-    if not is_youtube:
-        await msg.delete() # Not a link, not a range, delete it
-        return
-
-    # --- 3. Process YouTube Link ---
-    await msg.delete()
-    url = text.split()[0]
-    
-    # Clear any old state
-    context.user_data.clear()
-    
-    status_msg = await context.bot.send_message(chat_id=chat_id, text=f"{random.choice(SPINNER_FRAMES)} Fetching video info...")
-    context.user_data["menu_msg_id"] = status_msg.message_id
-    
-    try:
-        # Run blocking I/O in executor
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, get_video_info_sync, url)
-        
-        title = info.get("title", "video")
-        duration = int(info.get("duration") or 0)
-        
-        if duration == 0:
-            raise ValueError("Could not get video duration (maybe it's a live stream?)")
-            
-        qualities = await loop.run_in_executor(None, list_qualities_sync, info)
-        
-        # Store all info in user_data
-        context.user_data["video_url"] = url
-        context.user_data["title"] = title
-        context.user_data["duration"] = duration
-        context.user_data["qualities"] = qualities
-        context.user_data["state"] = {} # To store selections
-        
-        # Generate and show the full menu
-        menu_text, keyboard = await generate_menu_message(context)
-        await status_msg.edit_text(
-            text=menu_text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    except Exception as e:
-        logger.exception("Failed to get video info")
-        await status_msg.edit_text(f"❌ Failed to read video.\nError: {e}")
-        context.user_data.clear()
-
-
-async def files_not_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Deletes any non-text, non-command messages."""
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles all button presses from the inline menu."""
-    q = update.callback_query
-    await q.answer()
-    
-    data = (q.data or "").split(":")
-    action_type = data[0]
-    action_key = data[1]
-    
-    state = context.user_data.setdefault("state", {})
-    
-    if action_type == "set":
-        # --- Handle setting a value (dur, count, fmt) ---
-        if action_key == "dur":
-            val = data[2]
-            if val == "custom":
-                context.user_data["await_custom_range"] = True
-                await q.edit_message_text(
-                    f"{q.message.text}\n\n*Please send your custom range now* (e.g., `1:10-1:30`).",
-                    reply_markup=q.message.reply_markup,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return
-            else:
-                state["duration"] = int(val)
-                state["custom_range"] = None # Clear custom range if fixed one is set
-        
-        elif action_key == "count":
-            state["count"] = int(data[2])
-            
-        elif action_key == "fmt":
-            state["format"] = data[2]
-            state["format_label"#!/usr/bin/env python3
-"""
-Clipper bot: (Refactored & UI Enhanced)
-- Accepts text messages (YouTube links). Blocks files/photos.
-- /help, /feedback, /donate commands.
-- Features a single, self-updating inline menu for:
-  - Clip length (5,10,20,30,Custom up to MAX_CLIP_SECONDS)
-  - Number of clips (up to MAX_CLIPS)
-  - Format/quality from available source formats.
-- Supports custom range like "00H08M10S:00H09M20S" or "2:32-3:23" or "152-203".
-- Shows a ⚡ spinner + percentage while working, deletes spinner when done.
-- For files > 50MB uploads to GoFile and returns link (Telegram's limit is 50MB).
-- Auto-deletes user messages and commands to keep chat clean.
-"""
-import os
-import re
-import shlex
-import json
-import time
-import random
-import shutil
-import asyncio
-import logging
-import subprocess
-from typing import Optional, Tuple, List, Dict, Any
-
-import requests
-from dotenv import load_dotenv
-from yt_dlp import YoutubeDL
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    MessageEntity,
-)
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+import yt_dlp
+from moviepy import VideoFileClip
 
-# ---- 1. Config / Env ----
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID")) if os.getenv("ADMIN_ID") else None
-TMP_DIR = os.getenv("TMP_DIR", "tmp_clips")
-GOFILE_API_KEY = os.getenv("GOFILE_API_KEY", "") or None
-MAX_CLIP_SECONDS = int(os.getenv("MAX_CLIP_SECONDS", "180"))
-MAX_CLIPS = int(os.getenv("MAX_CLIPS", "5"))
-# Telegram's file limit is 50MB, not 20MB.
-TELEGRAM_FILE_LIMIT_MB = 49
 
-# Safety
-if MAX_CLIP_SECONDS > 10 * 60:  # Increase safety limit slightly
-    MAX_CLIP_SECONDS = min(MAX_CLIP_SECONDS, 10 * 60)
-
-# Logging
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
-logger = logging.getLogger("clipper")
+logger = logging.getLogger(__name__)
 
-# Spinner
-SPINNER_FRAMES = ["⚡", "⚡️", "⚡⚡", "⚡️⚡️"]
+BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip().lstrip('=')
+ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
+GOFILE_API_KEY = os.getenv('GOFILE_API_KEY', '').strip()
+MAX_CLIP_SECONDS = int(os.getenv('MAX_CLIP_SECONDS', '180'))
+MAX_CLIPS = int(os.getenv('MAX_CLIPS', '5'))
+HTTP_PORT = int(os.getenv('HTTP_PORT', '8080'))
 
-# Make tmp dir
-os.makedirs(TMP_DIR, exist_ok=True)
+DOWNLOAD_DIR = Path('downloads')
+CLIPS_DIR = Path('clips')
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+CLIPS_DIR.mkdir(exist_ok=True)
 
-
-# ---- 2. Time & String Helpers ----
-
-def clean_tmp():
-    """Best-effort cleanup of TMP_DIR"""
-    for f in os.listdir(TMP_DIR):
-        try:
-            path = os.path.join(TMP_DIR, f)
-            if os.path.isfile(path) or os.path.islink(path):
-                os.unlink(path)
-            elif os.path.isdir(path):
-                shutil.rmtree(path)
-        except Exception as e:
-            logger.warning(f"Failed to clean tmp file {f}: {e}")
-
-def safe_filename(name: str):
-    return re.sub(r"[^\w\-.]", "_", name)[:180]
-
-def parse_time_to_seconds(t: str) -> Optional[int]:
-    """
-    Accepts many formats:
-      - "00H08M10S"
-      - "2:32" => 152
-      - "2:32:10"
-      - "152" => 152
-    Returns seconds or None
-    """
-    t = t.strip().upper()
-    # H M S pattern
-    m = re.match(r'(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$', t)
-    if m and (m.group(1) or m.group(2) or m.group(3)):
-        h = int(m.group(1) or 0)
-        mm = int(m.group(2) or 0)
-        s = int(m.group(3) or 0)
-        return h * 3600 + mm * 60 + s
-    # colon format
-    if ":" in t:
-        parts = [int(p) for p in t.split(":") if p.strip().isdigit()]
-        if len(parts) == 2:  # mm:ss
-            return parts[0] * 60 + parts[1]
-        if len(parts) == 3:  # hh:mm:ss
-            return parts[0] * 3600 + parts[1] * 60 + parts[2]
-    # pure digits
-    if re.fullmatch(r"\d+", t):
-        return int(t)
-    return None
-
-def parse_range(s: str) -> Optional[Tuple[int, int]]:
-    """
-    Accepts:
-     - '00H08M10S:00H09M20S'
-     - '2:32-3:23'
-     - '152-203'
-     - '2:32 - 3:23' etc
-    Returns (start_sec, end_sec) or None
-    """
-    s = s.strip()
-    parts = re.split(r'\s*[-–to:aws]+\s*', s, flags=re.I)
-    
-    if len(parts) == 2: # 'start-end' or 'start:end'
-        a = parse_time_to_seconds(parts[0])
-        b = parse_time_to_seconds(parts[1])
-        if a is not None and b is not None and b > a:
-            return a, b
-            
-    # Try to find two time-like strings
-    tokens = re.findall(r'[\dHMS:]+', s, flags=re.I)
-    if len(tokens) >= 2:
-        a = parse_time_to_seconds(tokens[0])
-        b = parse_time_to_seconds(tokens[-1]) # Use first and last
-        if a is not None and b is not None and b > a:
-            return a, b
-            
-    return None
-
-def sec_to_hms(s: int) -> str:
-    h = s // 3600
-    m = (s % 3600) // 60
-    ss = s % 60
-    return f"{h:02d}:{m:02d}:{ss:02d}"
-
-def sec_to_human(s: int) -> str:
-    if s < 60:
-        return f"{s}s"
-    m, s = divmod(s, 60)
-    if m < 60:
-        return f"{m}m {s}s"
-    h, m = divmod(m, 60)
-    return f"{h}h {m}m {s}s"
+user_states: Dict[int, Dict] = {}
+processing_messages: Dict[int, int] = {}
+bot_stats = {'clips_created': 0, 'videos_processed': 0, 'total_users': set()}
 
 
-# ---- 3. Blocking I/O Helpers (to be run in executor) ----
-
-def run_subprocess_sync(cmd: List[str], timeout: int = 600):
-    """Run subprocess and return stdout. Raise on error."""
-    logger.info("Running cmd: %s", " ".join(shlex.quote(p) for p in cmd))
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, encoding='utf-8'
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr or proc.stdout or "process failed")
-        return proc.stdout
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"Process timed out after {timeout}s")
-    except Exception as e:
-        logger.error(f"Subprocess failed: {e}")
-        raise
-
-def gofile_upload_sync(filepath: str, timeout=120) -> Optional[str]:
-    """Uploads a file to GoFile. Blocking."""
-    if not GOFILE_API_KEY:
-        logger.warning("GOFILE_API_KEY not set. Cannot upload.")
-        return None
-    try:
-        r_server = requests.get("https://api.gofile.io/getServer", timeout=10)
-        r_server.raise_for_status()
-        server = r_server.json().get("data", {}).get("server")
-        if not server:
-            logger.error("GoFile: Could not get server.")
-            return None
-        
-        upload_url = f"https://{server}.gofile.io/uploadFile"
-        headers = {"Authorization": f"Bearer {GOFILE_API_KEY}"}
-        
-        with open(filepath, "rb") as fh:
-            files = {"file": (os.path.basename(filepath), fh)}
-            resp = requests.post(upload_url, files=files, headers=headers, timeout=timeout)
-        
-        resp.raise_for_status()
-        j = resp.json()
-        
-        if j.get("status") == "ok":
-            return j["data"]["downloadPage"]
-        else:
-            logger.warning("GoFile upload failed: %s", j)
-            return None
-    except Exception as e:
-        logger.exception("GoFile upload error: %s", e)
-    return None
-
-def get_video_info_sync(url: str, timeout=30) -> dict:
-    """Gets video info using yt-dlp. Blocking."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": "best",
-        "socket_timeout": timeout,
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-def list_qualities_sync(info: dict) -> List[Tuple[str, str, int]]:
-    """
-    Returns list of tuples (format_code, label, height) sorted by height desc.
-    label example: "1080p (webm)"
-    """
-    fmts = info.get("formats", [])
-    candidates = []
-    seen = set()
-    for f in fmts:
-        # We need formats that have both video and audio, or are video-only
-        # (yt-dlp will merge with best audio).
-        if f.get("vcodec") == "none":
-            continue
-            
-        fmt_id = f.get("format_id")
-        height = f.get("height") or 0
-        ext = f.get("ext") or "unknown"
-        vcodec = f.get("vcodec", "unknown")
-        
-        # Create a more descriptive label
-        label = f"{height}p" if height else f.get("format_note", "video")
-        if "avc" in vcodec:
-            label += " (mp4)"
-        elif "vp9" in vcodec:
-            label += " (webm)"
-        else:
-            label += f" ({ext})"
-            
-        key = (height, ext) # De-duplicate based on height and extension
-        if key not in seen and fmt_id:
-            candidates.append((fmt_id, label, height))
-            seen.add(key)
-            
-    # Sort by height descending
-    candidates.sort(key=lambda x: x[2], reverse=True)
-    
-    if not candidates:
-        return [("best", "best", 0)]
-        
-    return [(c[0], c[1], c[2]) for c in candidates]
+def format_timestamp(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours:02d}H{minutes:02d}M{secs:02d}S"
 
 
-# ---- 4. Telegram UI Generation ----
-
-async def generate_menu_message(context: ContextTypes.DEFAULT_TYPE) -> Tuple[str, InlineKeyboardMarkup]:
-    """Generates the text and keyboard for the main UI menu."""
-    data = context.user_data
-    state = data.get("state", {})
-    
-    # Get selections
-    sel_dur_val = state.get("duration")
-    sel_dur_range = state.get("custom_range")
-    sel_count = state.get("count")
-    sel_fmt = state.get("format")
-    sel_fmt_label = state.get("format_label", sel_fmt)
-
-    # --- Build Text ---
-    text = f"*Video:* `{data.get('title', '...')}`\n"
-    text += f"*Duration:* `{sec_to_human(data.get('duration', 0))}`\n\n"
-    text += "*Your Selections:*\n"
-    
-    # Duration text
-    if sel_dur_range:
-        start, end = sel_dur_range
-        text += f" • *Range:* `{sec_to_hms(start)} - {sec_to_hms(end)}` ({end-start}s)\n"
-    elif sel_dur_val:
-        text += f" • *Clip Length:* `{sel_dur_val}s`\n"
-    else:
-        text += f" • *Clip Length:* `(Not set)`\n"
-
-    # Count text
-    if sel_dur_range:
-        text += f" • *Num Clips:* `1 (Custom Range)`\n"
-        sel_count = 1 # Force count to 1 for custom range
-        state["count"] = 1
-    else:
-        text += f" • *Num Clips:* `{sel_count or '(Not set)'}`\n"
-
-    # Format text
-    text += f" • *Quality:* `{sel_fmt_label or '(Not set)'}`\n"
-
-    # --- Build Keyboard ---
-    keyboard = []
-    
-    # Row 1: Duration
-    dur_buttons = [
-        InlineKeyboardButton(f"{'✅ ' if sel_dur_val == 5 else ''}5s", callback_data="set:dur:5"),
-        InlineKeyboardButton(f"{'✅ ' if sel_dur_val == 10 else ''}10s", callback_data="set:dur:10"),
-        InlineKeyboardButton(f"{'✅ ' if sel_dur_val == 20 else ''}20s", callback_data="set:dur:20"),
-        InlineKeyboardButton(f"{'✅ ' if sel_dur_val == 30 else ''}30s", callback_data="set:dur:30"),
+def parse_timestamp(timestamp: str) -> Optional[int]:
+    patterns = [
+        r'(\d+)[hH](\d+)[mM](\d+)[sS]',
+        r'(\d+):(\d+):(\d+)',
+        r'(\d+)[mM](\d+)[sS]',
+        r'(\d+):(\d+)',
     ]
-    keyboard.append(dur_buttons)
     
-    # Row 2: Custom Range
-    custom_label = f"✅ Custom Range" if sel_dur_range else "Custom Range"
-    keyboard.append([InlineKeyboardButton(custom_label, callback_data="set:dur:custom")])
+    for pattern in patterns:
+        match = re.search(pattern, timestamp)
+        if match:
+            groups = match.groups()
+            if len(groups) == 3:
+                return int(groups[0]) * 3600 + int(groups[1]) * 60 + int(groups[2])
+            elif len(groups) == 2:
+                return int(groups[0]) * 60 + int(groups[1])
     
-    # Row 3: Clip Count (disabled if custom range is set)
-    if not sel_dur_range:
-        max_clips_allowed = min(MAX_CLIPS, max(1, data.get('duration', 0) // 5))
-        count_buttons = []
-        for i in range(1, max_clips_allowed + 1):
-            count_buttons.append(
-                InlineKeyboardButton(f"{'✅ ' if sel_count == i else ''}{i}", callback_data=f"set:count:{i}")
-            )
-        keyboard.append(count_buttons)
-
-    # Row 4+: Quality
-    qualities = data.get("qualities", [])
-    # Group qualities into rows of 2
-    for i in range(0, len(qualities[:6]), 2):
-        q_row = []
-        for fmt_id, label, height in qualities[i:i+2]:
-            q_row.append(
-                InlineKeyboardButton(f"{'✅ ' if sel_fmt == fmt_id else ''}{label}", callback_data=f"set:fmt:{fmt_id}:{label}")
-            )
-        keyboard.append(q_row)
-
-    # Final Row: Start / Download / Cancel
-    final_row = [InlineKeyboardButton("❌ Cancel", callback_data="action:cancel")]
+    if timestamp.isdigit():
+        return int(timestamp)
     
-    # Check if ready to start
-    if (sel_dur_val or sel_dur_range) and sel_count and sel_fmt:
-        final_row.insert(0, InlineKeyboardButton("✨ START CLIPPING ✨", callback_data="action:start"))
+    return None
+
+
+def parse_custom_range(text: str) -> Optional[tuple]:
+    auto_corrected = text.replace(' ', '').replace('h', 'H').replace('m', 'M').replace('s', 'S')
     
-    final_row.append(InlineKeyboardButton("💾 Full Video", callback_data="action:full"))
-    keyboard.append(final_row)
+    parts = auto_corrected.split(':')
+    if len(parts) != 2:
+        parts = re.split(r'[-,]', auto_corrected)
     
-    return text, InlineKeyboardMarkup(keyboard)
-
-async def clear_menu(context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Deletes the main menu and clears user_data state."""
-    menu_msg_id = context.user_data.get("menu_msg_id")
-    if menu_msg_id:
-        try:
-            await context.bot.edit_message_text(
-                text=text,
-                chat_id=context._chat_id,
-                message_id=menu_msg_id,
-                reply_markup=None
-            )
-        except BadRequest:
-            pass # Message might be deleted already
-    context.user_data.clear()
-
-
-# ---- 5. Telegram Handlers ----
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.delete()
-    await update.effective_user.send_message(
-        "Send me a YouTube link (just paste) and I'll help you cut clips.\n"
-        "Use /help for full instructions."
-    )
-    context.user_data.clear()
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.delete()
-    txt = (
-        "*Clipper Bot Guide:*\n\n"
-        "1. Paste a YouTube link.\n"
-        "2. A menu will appear. Select your desired *clip length*, *number of clips*, and *quality*.\n"
-        "3. Once all three are set, a `✨ START CLIPPING ✨` button will appear.\n\n"
-        "*Custom Range:*\n"
-        " • Select `Custom Range`.\n"
-        " • The bot will ask you to send a range.\n"
-        " • Reply with a range like `2:32-3:23`, `152-203`, or `00H08M10S-00H09M20S`.\n"
-        " • This will automatically set *Num Clips* to 1.\n\n"
-        "*Other Buttons:*\n"
-        " • `💾 Full Video`: Downloads the entire video.\n"
-        " • `❌ Cancel`: Cancels the current operation.\n\n"
-        "*Commands:*\n"
-        " /feedback <your message> - Send a message to the admin.\n"
-        " /donate - Get donation info."
-    )
-    await update.effective_user.send_message(txt, parse_mode=ParseMode.MARKDOWN)
-
-async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.delete()
-    upi = "upi://pay?pn=MD%20SHAHNAWAJ&am=&mode=01&pa=md.3282-40@waaxis"
-    await context.bot.send_message(
-        chat_id=update.effective_user.id,
-        text=f"Thank you for considering a donation!\n\nUse this link:\n`{upi}`",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    user = update.effective_user
-    feedback_text = msg.text.partition(' ')[2] # Get text after /feedback
-
-    if not feedback_text:
-        await msg.delete()
-        await msg.reply_text("Please write your feedback after the command, e.g., `/feedback This bot is great!`")
-        return
-
-    body = f"Feedback from {user.id} (@{user.username or 'N/A'}):\n\n{feedback_text}"
+    if len(parts) == 2:
+        start = parse_timestamp(parts[0])
+        end = parse_timestamp(parts[1])
+        if start is not None and end is not None and start < end:
+            return (start, end)
     
+    return None
+
+
+async def upload_to_gofile(file_path: Path) -> Optional[str]:
     try:
-        if ADMIN_ID:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=body)
-        await msg.reply_text("Thanks, your feedback has been sent to the admin.")
+        async with aiohttp.ClientSession() as session:
+            server_url = 'https://store1.gofile.io/uploadFile'
+            
+            async with aiofiles.open(file_path, 'rb') as f:
+                file_data = await f.read()
+            
+            data = aiohttp.FormData()
+            data.add_field('file', file_data, filename=file_path.name)
+            if GOFILE_API_KEY:
+                data.add_field('token', GOFILE_API_KEY)
+            
+            async with session.post(server_url, data=data) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    if result.get('status') == 'ok':
+                        return result['data']['downloadPage']
+                        
+        logger.error(f"GoFile upload failed for {file_path.name}")
+        return None
     except Exception as e:
-        logger.exception("Failed to forward feedback")
-        await msg.reply_text("Sorry, failed to send feedback. Please try again later.")
+        logger.error(f"GoFile upload error: {e}")
+        return None
+
+
+async def download_video(url: str, user_id: int) -> Optional[tuple]:
+    try:
+        output_path = DOWNLOAD_DIR / f"{user_id}_{datetime.now().timestamp()}"
+        
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best',
+            'outtmpl': str(output_path) + '.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                return None
+            filename = ydl.prepare_filename(info)
+            duration = info.get('duration', 0) if isinstance(info, dict) else 0
+            title = info.get('title', 'video') if isinstance(info, dict) else 'video'
+            
+            return (Path(filename), duration, title)
+            
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        return None
+
+
+async def create_clip(video_path: Path, start: int, end: int, output_path: Path) -> bool:
+    try:
+        clip = VideoFileClip(str(video_path))
+        subclip = clip.subclip(start, end)
+        subclip.write_videofile(
+            str(output_path),
+            codec='libx264',
+            audio_codec='aac',
+            temp_audiofile=str(output_path.parent / 'temp_audio.m4a'),
+            remove_temp=True,
+            logger=None
+        )
+        clip.close()
+        subclip.close()
+        return True
+    except Exception as e:
+        logger.error(f"Clip creation error: {e}")
+        return False
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+    
+    user = update.effective_user
+    bot_stats['total_users'].add(user.id)
+    
+    keyboard = [
+        [InlineKeyboardButton("📖 How to Use", callback_data="help")],
+        [InlineKeyboardButton("💬 Send Feedback", callback_data="feedback")],
+        [InlineKeyboardButton("☕ Donate", callback_data="donate")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    welcome_text = (
+        f"👋 <b>Welcome {user.first_name}!</b>\n\n"
+        f"🎬 <b>Clipper Bot</b> - Your Video Clipping Assistant\n\n"
+        f"✨ I can trim videos from YouTube, Instagram, Twitter, and more!\n\n"
+        f"💡 Just send me a video link and I'll help you create perfect clips.\n\n"
+        f"Use the buttons below to get started:"
+    )
+    
+    msg = await update.message.reply_text(
+        welcome_text,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
     
     await asyncio.sleep(2)
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+    await update.message.delete()
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main handler for all non-command text."""
-    msg = update.message
-    chat_id = msg.chat_id
-    text = (msg.text or "").strip()
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     
-    # --- 1. Check if we are awaiting a custom range ---
-    if context.user_data.get("await_custom_range"):
-        await msg.delete() # Delete user's range message
-        rng = parse_range(text)
-        if not rng:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Couldn't parse range. Try `2:32-3:23` or `152-203`.",
-                reply_to_message_id=context.user_data.get("menu_msg_id")
-            )
-            return # Keep awaiting
+    help_text = (
+        "📖 <b>How to Use Clipper Bot</b>\n\n"
+        "1️⃣ Send me a video link (YouTube, Instagram, Twitter, etc.)\n"
+        "2️⃣ Choose your clip length (5s, 10s, 20s, 30s, or Custom)\n"
+        "3️⃣ Select how many clips you want (1-5)\n"
+        "4️⃣ Wait for processing ⚡\n"
+        "5️⃣ Get your download links!\n\n"
+        "<b>Custom Format:</b>\n"
+        "• <code>00H08M10S:00H09M20S</code> (8m10s to 9m20s)\n"
+        "• <code>1:30-2:45</code> (1m30s to 2m45s)\n"
+        "• <code>90-150</code> (90s to 150s)\n\n"
+        "⚠️ <b>Note:</b> Text links or commands only!"
+    )
+    
+    msg = await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+    await asyncio.sleep(2)
+    await update.message.delete()
 
-        start, end = rng
-        length = end - start
-        if length <= 0 or length > MAX_CLIP_SECONDS:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"Invalid range. Max clip length is {MAX_CLIP_SECONDS}s.",
-                reply_to_message_id=context.user_data.get("menu_msg_id")
+
+async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+    
+    user_id = update.effective_user.id
+    user_states[user_id] = {'state': 'awaiting_feedback'}
+    
+    msg = await update.message.reply_text(
+        "💬 <b>Send Your Feedback</b>\n\n"
+        "Please type your message below:",
+        parse_mode=ParseMode.HTML
+    )
+    
+    await asyncio.sleep(2)
+    await update.message.delete()
+
+
+async def donate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    
+    upi_link = "upi://pay?pn=MD%20SHAHNAWAJ&am=&mode=01&pa=md.3282-40@waaxis"
+    
+    keyboard = [[InlineKeyboardButton("☕ Donate via UPI", url=upi_link)]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    msg = await update.message.reply_text(
+        "☕ <b>Support Clipper Bot</b>\n\n"
+        "Your donations help keep this bot running!\n"
+        "Thank you for your support! 🙏",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
+    
+    await asyncio.sleep(2)
+    await update.message.delete()
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+    
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    stats_text = (
+        f"📊 <b>Bot Statistics</b>\n\n"
+        f"👥 Total Users: {len(bot_stats['total_users'])}\n"
+        f"🎬 Videos Processed: {bot_stats['videos_processed']}\n"
+        f"✂️ Clips Created: {bot_stats['clips_created']}\n"
+    )
+    
+    await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
+    user_id = update.effective_user.id
+    text = update.message.text
+    
+    if user_id in user_states and user_states[user_id].get('state') == 'awaiting_feedback':
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"💬 <b>Feedback from {update.effective_user.first_name}</b>\n\n{text}",
+            parse_mode=ParseMode.HTML
+        )
+        await update.message.reply_text("✅ Thanks for your feedback!")
+        del user_states[user_id]
+        await asyncio.sleep(3)
+        await update.message.delete()
+        return
+    
+    if user_id in user_states and user_states[user_id].get('state') == 'awaiting_custom':
+        custom_range = parse_custom_range(text)
+        if custom_range:
+            start, end = custom_range
+            user_states[user_id]['clip_duration'] = end - start
+            user_states[user_id]['custom_range'] = (start, end)
+            user_states[user_id]['state'] = 'choose_clips'
+            
+            max_possible = min(MAX_CLIPS, 5)
+            keyboard = [[InlineKeyboardButton(f"{i} Clip{'s' if i > 1 else ''}", callback_data=f"clips_{i}")] for i in range(1, max_possible + 1)]
+            
+            await update.message.reply_text(
+                f"✅ Custom range set: {format_timestamp(start)} - {format_timestamp(end)}\n\n"
+                f"How many clips do you want?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            await update.message.delete()
+        else:
+            await update.message.reply_text(
+                "❌ Invalid format! Try:\n"
+                "• <code>00H08M10S:00H09M20S</code>\n"
+                "• <code>1:30-2:45</code>\n"
+                "• <code>90-150</code>",
+                parse_mode=ParseMode.HTML
+            )
+            await asyncio.sleep(5)
+            await update.message.delete()
+        return
+    
+    url_pattern = r'https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&/=]*)'
+    urls = re.findall(url_pattern, text)
+    
+    if urls:
+        user_states[user_id] = {
+            'url': urls[0],
+            'state': 'choose_duration'
+        }
+        
+        keyboard = [
+            [InlineKeyboardButton("5s", callback_data="dur_5"), InlineKeyboardButton("10s", callback_data="dur_10")],
+            [InlineKeyboardButton("20s", callback_data="dur_20"), InlineKeyboardButton("30s", callback_data="dur_30")],
+            [InlineKeyboardButton("✏️ Custom", callback_data="dur_custom")]
+        ]
+        
+        msg = await update.message.reply_text(
+            "🎬 <b>Video link received!</b>\n\n"
+            "⏱️ Choose your clip length:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML
+        )
+        
+        await asyncio.sleep(2)
+        await update.message.delete()
+    else:
+        msg = await update.message.reply_text(
+            "⚠️ <b>Text links or commands only.</b>\n\n"
+            "Please send a valid video URL or use /help for instructions.",
+            parse_mode=ParseMode.HTML
+        )
+        await asyncio.sleep(5)
+        try:
+            await update.message.delete()
+            await msg.delete()
+        except:
+            pass
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user or not query.data:
+        return
+    
+    await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    if data == "help":
+        help_text = (
+            "📖 <b>How to Use Clipper Bot</b>\n\n"
+            "1️⃣ Send me a video link\n"
+            "2️⃣ Choose clip length\n"
+            "3️⃣ Select number of clips\n"
+            "4️⃣ Get your downloads!\n\n"
+            "<b>Custom Format:</b>\n"
+            "• <code>00H08M10S:00H09M20S</code>\n"
+            "• <code>1:30-2:45</code>\n"
+            "• <code>90-150</code>"
+        )
+        await query.edit_message_text(help_text, parse_mode=ParseMode.HTML)
+        
+    elif data == "feedback":
+        user_states[user_id] = {'state': 'awaiting_feedback'}
+        await query.edit_message_text(
+            "💬 <b>Send Your Feedback</b>\n\n"
+            "Please type your message:",
+            parse_mode=ParseMode.HTML
+        )
+        
+    elif data == "donate":
+        upi_link = "upi://pay?pn=MD%20SHAHNAWAJ&am=&mode=01&pa=md.3282-40@waaxis"
+        keyboard = [[InlineKeyboardButton("☕ Donate via UPI", url=upi_link)]]
+        await query.edit_message_text(
+            "☕ <b>Support Clipper Bot</b>\n\n"
+            "Your donations help keep this bot running!\n"
+            "Thank you! 🙏",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML
+        )
+        
+    elif data.startswith("dur_"):
+        if user_id not in user_states:
+            await query.edit_message_text("❌ Session expired. Please send the video link again.")
+            return
+        
+        duration_map = {"dur_5": 5, "dur_10": 10, "dur_20": 20, "dur_30": 30}
+        
+        if data == "dur_custom":
+            user_states[user_id]['state'] = 'awaiting_custom'
+            await query.edit_message_text(
+                "✏️ <b>Custom Range</b>\n\n"
+                "Enter in format:\n"
+                "• <code>00H08M10S:00H09M20S</code>\n"
+                "• <code>1:30-2:45</code>\n"
+                "• <code>90-150</code>",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            duration = duration_map.get(data, 10)
+            user_states[user_id]['clip_duration'] = duration
+            user_states[user_id]['state'] = 'choose_clips'
+            
+            max_possible = min(MAX_CLIPS, 5)
+            keyboard = [[InlineKeyboardButton(f"{i} Clip{'s' if i > 1 else ''}", callback_data=f"clips_{i}")] for i in range(1, max_possible + 1)]
+            
+            await query.edit_message_text(
+                f"⏱️ Clip length: <b>{duration}s</b>\n\n"
+                f"How many clips do you want?",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.HTML
+            )
+            
+    elif data.startswith("clips_"):
+        if user_id not in user_states:
+            await query.edit_message_text("❌ Session expired. Please send the video link again.")
+            return
+        
+        num_clips = int(data.split("_")[1])
+        user_states[user_id]['num_clips'] = num_clips
+        
+        await query.edit_message_text(
+            f"💥⚡💥 <b>Processing your request...</b>\n\n"
+            f"Please wait while I work on your video!",
+            parse_mode=ParseMode.HTML
+        )
+        if query.message:
+            processing_messages[user_id] = query.message.message_id
+        
+        await process_video(query, context, user_id)
+
+
+async def process_video(query, context, user_id: int):
+    try:
+        state = user_states.get(user_id)
+        if not state:
+            return
+        
+        url = state['url']
+        clip_duration = state['clip_duration']
+        num_clips = state['num_clips']
+        custom_range = state.get('custom_range')
+        
+        total_duration = clip_duration * num_clips if not custom_range else clip_duration
+        
+        if total_duration > MAX_CLIP_SECONDS:
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=processing_messages[user_id],
+                text=f"⚙️ <b>This may take a while...</b>\n\n"
+                     f"Processing {num_clips} clip{'s' if num_clips > 1 else ''} ({total_duration}s total)\n"
+                     f"Please be patient! 💥⚡💥",
+                parse_mode=ParseMode.HTML
+            )
+        
+        await context.bot.edit_message_text(
+            chat_id=query.message.chat_id,
+            message_id=processing_messages[user_id],
+            text=f"📥 <b>Downloading video...</b> 💥⚡💥",
+            parse_mode=ParseMode.HTML
+        )
+        
+        download_result = await download_video(url, user_id)
+        if not download_result:
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=processing_messages[user_id],
+                text="❌ <b>Download failed!</b>\n\nPlease check your link and try again.",
+                parse_mode=ParseMode.HTML
             )
             return
-
-        # Success! Save state and update menu
-        context.user_data["await_custom_range"] = False
-        state = context.user_data.setdefault("state", {})
-        state["custom_range"] = (start, end)
-        state["duration"] = None # Clear fixed duration
-        state["count"] = 1 # Custom range is always 1 clip
         
-        # Update the menu
-        menu_text, keyboard = await generate_menu_message(context)
-        await context.bot.edit_message_text(
-            text=menu_text,
-            chat_id=chat_id,
-            message_id=context.user_data.get("menu_msg_id"),
-            reply_markup=keyboard,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    # --- 2. Check if it's a YouTube link ---
-    is_youtube = "youtube.com" in text or "youtu.be" in text
-    if not is_youtube:
-        await msg.delete() # Not a link, not a range, delete it
-        return
-
-    # --- 3. Process YouTube Link ---
-    await msg.delete()
-    url = text.split()[0]
-    
-    # Clear any old state
-    context.user_data.clear()
-    
-    status_msg = await context.bot.send_message(chat_id=chat_id, text=f"{random.choice(SPINNER_FRAMES)} Fetching video info...")
-    context.user_data["menu_msg_id"] = status_msg.message_id
-    
-    try:
-        # Run blocking I/O in executor
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, get_video_info_sync, url)
+        video_path, video_duration, video_title = download_result
+        bot_stats['videos_processed'] += 1
         
-        title = info.get("title", "video")
-        duration = int(info.get("duration") or 0)
-        
-        if duration == 0:
-            raise ValueError("Could not get video duration (maybe it's a live stream?)")
-            
-        qualities = await loop.run_in_executor(None, list_qualities_sync, info)
-        
-        # Store all info in user_data
-        context.user_data["video_url"] = url
-        context.user_data["title"] = title
-        context.user_data["duration"] = duration
-        context.user_data["qualities"] = qualities
-        context.user_data["state"] = {} # To store selections
-        
-        # Generate and show the full menu
-        menu_text, keyboard = await generate_menu_message(context)
-        await status_msg.edit_text(
-            text=menu_text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    except Exception as e:
-        logger.exception("Failed to get video info")
-        await status_msg.edit_text(f"❌ Failed to read video.\nError: {e}")
-        context.user_data.clear()
-
-
-async def files_not_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Deletes any non-text, non-command messages."""
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles all button presses from the inline menu."""
-    q = update.callback_query
-    await q.answer()
-    
-    data = (q.data or "").split(":")
-    action_type = data[0]
-    action_key = data[1]
-    
-    state = context.user_data.setdefault("state", {})
-    
-    if action_type == "set":
-        # --- Handle setting a value (dur, count, fmt) ---
-        if action_key == "dur":
-            val = data[2]
-            if val == "custom":
-                context.user_data["await_custom_range"] = True
-                await q.edit_message_text(
-                    f"{q.message.text}\n\n*Please send your custom range now* (e.g., `1:10-1:30`).",
-                    reply_markup=q.message.reply_markup,
-                    parse_mode=ParseMode.MARKDOWN
+        if custom_range:
+            start, end = custom_range
+            if end > video_duration:
+                await context.bot.edit_message_text(
+                    chat_id=query.message.chat_id,
+                    message_id=processing_messages[user_id],
+                    text=f"❌ <b>Invalid range!</b>\n\n"
+                         f"Video duration is only {format_timestamp(video_duration)}.\n"
+                         f"Your requested end time ({format_timestamp(end)}) exceeds the video length.",
+                    parse_mode=ParseMode.HTML
                 )
+                video_path.unlink(missing_ok=True)
                 return
-            else:
-                state["duration"] = int(val)
-                state["custom_range"] = None # Clear custom range if fixed one is set
+        elif clip_duration > video_duration:
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=processing_messages[user_id],
+                text=f"❌ <b>Clip too long!</b>\n\n"
+                     f"Video duration is only {format_timestamp(video_duration)}.\n"
+                     f"Your requested clip length ({clip_duration}s) is longer than the video.",
+                parse_mode=ParseMode.HTML
+            )
+            video_path.unlink(missing_ok=True)
+            return
         
-        elif action_key == "count":
-            state["count"] = int(data[2])
+        await context.bot.edit_message_text(
+            chat_id=query.message.chat_id,
+            message_id=processing_messages[user_id],
+            text=f"✂️ <b>Creating clips...</b> 💥⚡💥\n\n"
+                 f"Video: {video_title[:40]}...",
+            parse_mode=ParseMode.HTML
+        )
+        
+        clips_created = []
+        
+        if custom_range:
+            start, end = custom_range
+            start = max(0, min(start, video_duration - 1))
+            end = max(start + 1, min(end, video_duration))
+            output_file = CLIPS_DIR / f"{user_id}_clip_1.mp4"
+            success = await create_clip(video_path, start, end, output_file)
+            if success:
+                clips_created.append(output_file)
+                bot_stats['clips_created'] += 1
+        else:
+            interval = max(1, int((video_duration - clip_duration) / max(num_clips - 1, 1)))
             
-        elif action_key == "fmt":
-            state["format"] = data[2]
-            state["format_label"
+            for i in range(num_clips):
+                start = max(0, min(i * interval, video_duration - clip_duration))
+                end = min(start + clip_duration, video_duration)
+                
+                output_file = CLIPS_DIR / f"{user_id}_clip_{i+1}.mp4"
+                success = await create_clip(video_path, start, end, output_file)
+                if success:
+                    clips_created.append(output_file)
+                    bot_stats['clips_created'] += 1
+        
+        if not clips_created:
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=processing_messages[user_id],
+                text="❌ <b>Clip creation failed!</b>\n\nPlease try again later.",
+                parse_mode=ParseMode.HTML
+            )
+            video_path.unlink(missing_ok=True)
+            return
+        
+        await context.bot.edit_message_text(
+            chat_id=query.message.chat_id,
+            message_id=processing_messages[user_id],
+            text=f"☁️ <b>Uploading to GoFile...</b> 💥⚡💥",
+            parse_mode=ParseMode.HTML
+        )
+        
+        upload_links = []
+        for clip_file in clips_created:
+            link = await upload_to_gofile(clip_file)
+            if link:
+                upload_links.append(link)
+            clip_file.unlink(missing_ok=True)
+        
+        video_path.unlink(missing_ok=True)
+        
+        if upload_links:
+            result_text = f"✅ <b>All Done!</b>\n\n"
+            result_text += f"🎬 Created {len(upload_links)} clip{'s' if len(upload_links) > 1 else ''}:\n\n"
+            
+            for idx, link in enumerate(upload_links, 1):
+                result_text += f"{idx}. <a href='{link}'>Download Clip {idx}</a>\n"
+            
+            keyboard = [[InlineKeyboardButton("🔄 Create Another", callback_data="help")]]
+            
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=processing_messages[user_id],
+                text=result_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+        else:
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=processing_messages[user_id],
+                text="❌ <b>Upload failed!</b>\n\nClips were created but upload failed. Please try again.",
+                parse_mode=ParseMode.HTML
+            )
+        
+        if user_id in user_states:
+            del user_states[user_id]
+        if user_id in processing_messages:
+            del processing_messages[user_id]
+            
+    except Exception as e:
+        logger.error(f"Processing error for user {user_id}: {e}")
+        try:
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=processing_messages.get(user_id),
+                text=f"❌ <b>An error occurred!</b>\n\n{str(e)[:100]}",
+                parse_mode=ParseMode.HTML
+            )
+        except:
+            pass
+
+
+def main():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN not found in environment variables!")
+        return
+    
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("feedback", feedback_command))
+    application.add_handler(CommandHandler("donate", donate_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    logger.info("🚀 Clipper Bot started!")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == '__main__':
+    main()
