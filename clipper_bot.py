@@ -133,34 +133,51 @@ async def upload_to_gofile(file_path: Path) -> Optional[str]:
         return None
     except Exception as e:
         logger.error(f"GoFile upload error: {e}")
-        return None
+        return None 
 
 
 async def download_video(url: str, user_id: int) -> Optional[tuple]:
     try:
         output_path = DOWNLOAD_DIR / f"{user_id}_{datetime.now().timestamp()}"
-        
+
+        # ---- Handle cookies (Render Secret -> cookies.txt) ----
+        import base64
+        COOKIE_PATH = None
+        if os.getenv("COOKIES_B64"):
+            try:
+                with open("cookies.txt", "wb") as f:
+                    f.write(base64.b64decode(os.getenv("COOKIES_B64")))
+                COOKIE_PATH = "cookies.txt"
+                logger.info("✅ Cookies file loaded successfully.")
+            except Exception as e:
+                logger.error(f"Failed to decode or write cookies: {e}")
+
+        # ---- yt-dlp options ----
         ydl_opts = {
-            'format': 'best[ext=mp4]/best',
-            'outtmpl': str(output_path) + '.%(ext)s',
-            'quiet': True,
-            'no_warnings': True,
+            "format": "best[ext=mp4]/best",
+            "outtmpl": str(output_path) + ".%(ext)s",
+            "quiet": True,
+            "no_warnings": True,
         }
-        
+
+        # add cookies if available
+        if COOKIE_PATH:
+            ydl_opts["cookiefile"] = COOKIE_PATH
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if not info:
                 return None
+
             filename = ydl.prepare_filename(info)
-            duration = info.get('duration', 0) if isinstance(info, dict) else 0
-            title = info.get('title', 'video') if isinstance(info, dict) else 'video'
-            
+            duration = info.get("duration", 0) if isinstance(info, dict) else 0
+            title = info.get("title", "video") if isinstance(info, dict) else "video"
+
             return (Path(filename), duration, title)
-            
+
     except Exception as e:
         logger.error(f"Download error: {e}")
         return None
-
 
 async def create_clip(video_path: Path, start: int, end: int, output_path: Path) -> bool:
     try:
