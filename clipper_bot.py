@@ -682,8 +682,53 @@ def main():
     loop.create_task(start_health_server())
     # -------------------------------------------------------------------
     
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # ===================== WEBHOOK MODE (Render Deployment) =====================
+
+async def main():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN not found in environment variables!")
+        return
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Register your handlers
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("feedback", feedback_command))
+    app.add_handler(CommandHandler("donate", donate_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Start the health check server in background (important for Render)
+    asyncio.create_task(start_health_server())
+
+    # Remove any previous webhook to avoid conflicts
+    await app.bot.delete_webhook(drop_pending_updates=True)
+
+    # Use Render-provided PORT and your app’s public HTTPS URL
+    port = int(os.environ.get("PORT", os.environ.get("HTTP_PORT", 8080)))
+    public_url = os.environ.get("PUBLIC_URL")  # e.g. https://your-app-name.onrender.com
+    if not public_url:
+        logger.error("PUBLIC_URL is missing. Set PUBLIC_URL in Render env vars.")
+        return
+
+    webhook_path = os.environ.get("WEBHOOK_PATH", BOT_TOKEN)
+    webhook_url = f"{public_url.rstrip('/')}/{webhook_path.lstrip('/')}"
+
+    logger.info(f"🚀 Clipper Bot webhook running at: {webhook_url}")
+
+    # Run webhook (instead of polling)
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=webhook_path,
+        webhook_url=webhook_url,
+    )
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped.")
