@@ -272,8 +272,11 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def donate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+    if not update.update.effective_user or not update.message:
         return
+ 
+    user_id = update.effective_user.id
+    user_states[user_id] = {'state': 'awaiting_donation'}
     
     upi_link = "upi://pay?pn=MD%20SHAHNAWAJ&am=&mode=01&pa=md.3282-40@waaxis"
     
